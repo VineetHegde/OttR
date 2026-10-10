@@ -1,0 +1,28 @@
+{
+  "app": "Taskmgr.exe",
+  "aliases": [
+    "taskmgr",
+    "task manager"
+  ],
+  "search_name": "taskmgr",
+  "exe_path": "C:\\Windows\\System32\\Taskmgr.exe",
+  "direct_launch": true,
+  "launch_steps": [
+    {
+      "action": "type_text",
+      "text": "task"
+    },
+    {
+      "action": "press_key",
+      "key": "enter"
+    }
+  ],
+  "opened_by": null,
+  "lifecycle_seen": {
+    "activated": 1,
+    "opened": 1
+  },
+  "actions": [],
+  "sessions": 1,
+  "updated": "2026-10-10T18:50:03"
+}

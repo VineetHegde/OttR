@@ -1,0 +1,130 @@
+{
+  "app": "flux.exe",
+  "aliases": [
+    "flux",
+    "f.lux: normal all the time",
+    "f.lux: normal all the time ",
+    "context",
+    "effects and extra colors"
+  ],
+  "search_name": "flux",
+  "exe_path": "C:\\Program Files\\WindowsApps\\F.luxSoftwareLLC.f.lux_4.137.0.0_x86__sw1dyjdkns7gt\\Flux\\flux.exe",
+  "direct_launch": false,
+  "launch_steps": [],
+  "opened_by": null,
+  "lifecycle_seen": {
+    "activated": 3,
+    "opened": 2,
+    "closed": 2
+  },
+  "actions": [
+    {
+      "name": "Click Context",
+      "steps": [
+        {
+          "app": "flux.exe",
+          "window_class": "#32768",
+          "action": "click_element",
+          "target": {
+            "name": "Context",
+            "control_type": "MenuControl",
+            "automation_id": "",
+            "class_name": "#32768",
+            "parent_name": ""
+          },
+          "fallback_rel_pos": [
+            0.0,
+            0.0
+          ]
+        }
+      ],
+      "postcondition": null,
+      "signature": "02377c3b1efe",
+      "after": []
+    },
+    {
+      "name": "Click Macular Pigment",
+      "steps": [
+        {
+          "app": "flux.exe",
+          "window_class": "#32768",
+          "action": "click_element",
+          "target": {
+            "name": "Macular Pigment",
+            "control_type": "MenuItemControl",
+            "automation_id": "4002",
+            "class_name": "",
+            "parent_name": ""
+          },
+          "fallback_rel_pos": [
+            0.8369,
+            0.6571
+          ]
+        }
+      ],
+      "postcondition": null,
+      "signature": "0b035c562fc3",
+      "after": [
+        "02377c3b1efe"
+      ]
+    },
+    {
+      "name": "Click f.lux: Normal all the time, Context, Macular Pigment",
+      "steps": [
+        {
+          "app": "flux.exe",
+          "window_class": "ytWindow",
+          "action": "click_element",
+          "target": {
+            "name": "f.lux: Normal all the time",
+            "control_type": "WindowControl",
+            "automation_id": "",
+            "class_name": "ytWindow",
+            "parent_name": ""
+          },
+          "fallback_rel_pos": [
+            0.075,
+            0.1887
+          ]
+        },
+        {
+          "app": "flux.exe",
+          "window_class": "#32768",
+          "action": "click_element",
+          "target": {
+            "name": "Context",
+            "control_type": "MenuControl",
+            "automation_id": "",
+            "class_name": "#32768",
+            "parent_name": ""
+          },
+          "fallback_rel_pos": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "app": "flux.exe",
+          "window_class": "#32768",
+          "action": "click_element",
+          "target": {
+            "name": "Macular Pigment",
+            "control_type": "MenuItemControl",
+            "automation_id": "4002",
+            "class_name": "",
+            "parent_name": ""
+          },
+          "fallback_rel_pos": [
+            0.3292,
+            0.4857
+          ]
+        }
+      ],
+      "postcondition": null,
+      "signature": "f0edfd5fd72e",
+      "after": []
+    }
+  ],
+  "sessions": 1,
+  "updated": "2026-10-10T18:50:03"
+}
