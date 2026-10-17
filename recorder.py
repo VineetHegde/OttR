@@ -1,41 +1,23 @@
 """
 recorder.py (v3) - free-form session recorder
-
-Records everything you do during a learning session:
-  * clicks, with UI Automation element info. If an element has no name (games,
-    Java apps, custom-drawn UIs) it also saves the click position inside the window
-    plus a tiny image crop, so the click can still be found again later.
-  * typed text and key presses (password fields are never stored)
-  * window lifecycle: opened, closed, minimized, restored, activated
-  * the state of a clicked element shortly after the click (selected / toggled / expanded)
-
-Hotkeys:   F7 = pause / resume     F8 = stop and save
-Output:    raw_recording.json  (read by learner.py, then deleted)
-
-Needs:  pip install uiautomation psutil pynput pillow
 """
-import ctypes
-import json
 import os
 import queue
 import threading
 import time
-from ctypes import wintypes
 
-import psutil
 import uiautomation as auto
 from pynput import keyboard, mouse
+
+from common import read_state, save_json
+# importing winapi also sets DPI awareness (pynput, UI Automation and screenshots must share pixel coordinates)
+from winapi import (FRAME_HOST, app_of_hwnd, find_host_apps, list_windows, proc_name,  # noqa: F401
+                    resolve_app, user32, window_class, window_text)
 
 try:
     from PIL import ImageGrab
 except ImportError:  # crops are optional
     ImageGrab = None
-
-# pynput, UI Automation and screenshots must use the same pixel coordinates.
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    pass
 
 OUTPUT_FILE = "raw_recording.json"
 CROP_DIR = os.path.join("skills", "crops")
@@ -45,155 +27,6 @@ STATE_DELAY = 0.5       # wait this long after a click before reading element st
 CROP_SIZE = 48          # pixels, only used for unnamed elements
 STOP_KEY = keyboard.Key.f8
 PAUSE_KEY = keyboard.Key.f7
-
-# ---------------------------------------------------------------------------
-# Win32 helpers (plain ctypes: no COM, safe to call from any thread)
-# ---------------------------------------------------------------------------
-user32 = ctypes.windll.user32
-dwmapi = ctypes.windll.dwmapi
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-GWL_EXSTYLE = -20
-WS_EX_TOOLWINDOW = 0x00000080
-GW_OWNER = 4
-DWMWA_CLOAKED = 14
-IGNORED_CLASSES = {"Progman", "WorkerW"}
-FRAME_HOST = "applicationframehost.exe"
-
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.IsIconic.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
-user32.GetWindow.restype = wintypes.HWND
-user32.GetForegroundWindow.restype = wintypes.HWND
-user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
-user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
-dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
-
-
-def window_text(hwnd):
-    n = user32.GetWindowTextLengthW(hwnd)
-    buf = ctypes.create_unicode_buffer(n + 1)
-    user32.GetWindowTextW(hwnd, buf, n + 1)
-    return buf.value
-
-
-def window_class(hwnd):
-    buf = ctypes.create_unicode_buffer(256)
-    user32.GetClassNameW(hwnd, buf, 256)
-    return buf.value
-
-
-def hwnd_pid(hwnd):
-    pid = wintypes.DWORD(0)
-    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    return pid.value
-
-
-def list_windows():
-    """Visible, un-cloaked, top-level 'real' windows: {hwnd: info}."""
-    found = {}
-
-    def cb(hwnd, _lparam):
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            if user32.GetWindow(hwnd, GW_OWNER):
-                return True
-            if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
-                return True
-            if user32.GetWindowTextLengthW(hwnd) == 0:
-                return True
-            cloaked = ctypes.c_int(0)
-            dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
-            if cloaked.value:
-                return True
-            cls = window_class(hwnd)
-            if cls in IGNORED_CLASSES:
-                return True
-            found[int(hwnd)] = {
-                "title": window_text(hwnd),
-                "class": cls,
-                "pid": hwnd_pid(hwnd),
-                "minimized": bool(user32.IsIconic(hwnd)),
-            }
-        except Exception:
-            pass
-        return True
-
-    user32.EnumWindows(WNDENUMPROC(cb), 0)
-    return found
-
-
-def proc_name(pid):
-    try:
-        return psutil.Process(pid).name()
-    except Exception:
-        return "unknown"
-
-
-def proc_exe(pid):
-    try:
-        return psutil.Process(pid).exe()
-    except Exception:
-        return ""
-
-
-def child_pid(hwnd, frame_pid):
-    """Store apps live inside a frame window owned by ApplicationFrameHost; the real app is a child."""
-    pids = []
-
-    def cb(child, _lparam):
-        p = hwnd_pid(child)
-        if p and p != frame_pid:
-            pids.append(p)
-        return True
-
-    user32.EnumChildWindows(hwnd, WNDENUMPROC(cb), 0)
-    return pids[0] if pids else frame_pid
-
-
-app_cache = {}  # hwnd -> (app name, exe path)
-
-
-def resolve_app(hwnd, pid):
-    """Returns (app_name, exe_path, resolved)."""
-    cached = app_cache.get(hwnd)
-    if cached:
-        return cached[0], cached[1], True
-    name, exe, resolved = proc_name(pid), proc_exe(pid), True
-    if name.lower() == FRAME_HOST:
-        pid2 = child_pid(hwnd, pid)
-        if pid2 != pid:
-            name, exe = proc_name(pid2), proc_exe(pid2)
-        else:
-            resolved = False
-    if resolved:
-        app_cache[hwnd] = (name, exe)
-    return name, exe, resolved
-
-
-def app_of_hwnd(hwnd):
-    name, exe, _ = resolve_app(hwnd, hwnd_pid(hwnd))
-    return name, exe
-
-
-def find_host_apps():
-    """Programs that host THIS assistant (e.g. the terminal / VS Code). Ignored while learning."""
-    skip = {"explorer.exe", "services.exe", "wininit.exe", "system", "svchost.exe",
-            "winlogon.exe", "smss.exe", "csrss.exe"}
-    names = []
-    try:
-        for p in psutil.Process().parents():
-            if p.name().lower() not in skip:
-                names.append(p.name())
-    except Exception:
-        pass
-    return names
-
 
 HOST_APPS = find_host_apps()
 
@@ -230,7 +63,7 @@ def add_char(ch):
         first = not type_buffer
         type_buffer.append(ch)
     if first:
-        events_q.put({"kind": "probe"})  # worker checks whether the focused field is a password box
+        events_q.put({"kind": "probe"})  
 
 
 def key_label(key):
@@ -270,7 +103,7 @@ def on_press(key):
         return
     if not isinstance(key, keyboard.KeyCode) and key not in (keyboard.Key.space, keyboard.Key.backspace):
         label = key_label(key)
-        if label in down_keys:  # auto-repeat of a held special key
+        if label in down_keys:  
             return
         down_keys.add(label)
     if held_mods:
@@ -314,30 +147,6 @@ def on_release(key):
 # ---------------------------------------------------------------------------
 # Worker: does all UI Automation + window polling in ONE thread
 # ---------------------------------------------------------------------------
-def read_state(ctrl):
-    """State of a control that has one (selected / toggled / expanded)."""
-    st = {}
-    try:
-        p = ctrl.GetSelectionItemPattern()
-        if p:
-            st["selected"] = bool(p.IsSelected)
-    except Exception:
-        pass
-    try:
-        p = ctrl.GetTogglePattern()
-        if p:
-            st["toggle"] = int(p.ToggleState)
-    except Exception:
-        pass
-    try:
-        p = ctrl.GetExpandCollapsePattern()
-        if p:
-            st["expanded"] = int(p.ExpandCollapseState)
-    except Exception:
-        pass
-    return st
-
-
 def nearest_named_parent(ctrl, levels=4):
     try:
         p = ctrl
@@ -410,9 +219,14 @@ class Worker:
         if kind == "probe":
             try:
                 focused = auto.GetFocusedControl()
-                self.password_field = bool(focused and getattr(focused, "IsPassword", False))
+                is_pw = bool(focused and getattr(focused, "IsPassword", False))
+                if is_pw and not self.password_field:
+                    for r in reversed(self.records[-3:]):
+                        if r.get("action") == "type_text" and not r.get("sensitive"):
+                            r["text"], r["sensitive"] = None, True
+                self.password_field = is_pw
             except Exception:
-                self.password_field = True  # fail closed: hide text if unsure
+                self.password_field = True  
 
         elif kind == "click":
             self.handle_click(ev)
@@ -488,7 +302,7 @@ class Worker:
             },
         }
         if not name.strip() and not aid.strip():
-            crop = self.save_crop(x, y)  # only for elements we cannot name
+            crop = self.save_crop(x, y)  
             if crop:
                 rec["crop"] = crop
         self.emit(rec, f"click  [{ctrl.ControlTypeName}] '{name}' in {app}")
@@ -521,7 +335,7 @@ class Worker:
     def poll_windows(self, now):
         cur = list_windows()
 
-        if self.prev is None:  # first look: this is the starting situation
+        if self.prev is None:  
             self.prev = {}
             start = []
             for hwnd, info in cur.items():
@@ -536,7 +350,7 @@ class Worker:
         for hwnd, info in cur.items():
             if hwnd not in self.prev:
                 app, exe, ok = resolve_app(hwnd, info["pid"])
-                if not ok:  # wait a little for the real app name of a Store-app frame
+                if not ok:  
                     n = self.unresolved.get(hwnd, 0) + 1
                     self.unresolved[hwnd] = n
                     if n < 5:
@@ -554,7 +368,7 @@ class Worker:
                 )
             else:
                 old = self.prev[hwnd]
-                if old["app"].lower() == FRAME_HOST:   # keep trying to find the real app
+                if old["app"].lower() == FRAME_HOST:   
                     app2, _, ok2 = resolve_app(hwnd, info["pid"])
                     old["app"] = app2 if ok2 else self.fix_app(old["app"], info["title"])
                 if info["minimized"] != old["minimized"]:
@@ -626,17 +440,17 @@ def main():
 
     ml = mouse.Listener(on_click=on_click)
     ml.start()
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as kl:
-        kl.join()
-    ml.stop()
-
-    events_q.put(None)
-    wt.join(timeout=15)
-
-    records = sorted(worker.records, key=lambda e: e["t"])
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved {len(records)} events to '{OUTPUT_FILE}'.")
+    try:
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as kl:
+            kl.join()
+    finally:
+        # runs on F8, Ctrl+C or an error: whatever was recorded is still saved
+        ml.stop()
+        events_q.put(None)
+        wt.join(timeout=15)
+        records = sorted(worker.records, key=lambda e: e["t"])
+        save_json(OUTPUT_FILE, records)
+        print(f"\nSaved {len(records)} events to '{OUTPUT_FILE}'.")
 
 
 if __name__ == "__main__":

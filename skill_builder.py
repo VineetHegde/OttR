@@ -1,23 +1,24 @@
 """
-skill_builder.py (v2)
+skill_builder.py (v3)
 
-Turns raw_recording.json into a reusable skill file in ./skills/.
+Turns raw_recording.json into a reusable skill file in ./skills/  (the /teach flow).
 
-The steps are built by plain code (reliable). The local LLM is only asked for a
-short name and description, using a JSON schema (no template to copy).
+The steps are built by plain code (learner.build_steps, the same builder /learn uses, so unnamed
+elements, position clicks and passwords are handled the same way). The local LLM is only asked for
+a short name and description, using a JSON schema (no template to copy).
 """
 import json
 import os
-import re
 from collections import Counter
 from datetime import datetime
 
 import ollama
 
-MODEL = "llama3.2:1b"  # change here if you switch models
+import learner
+from common import MODEL, describe_step, parse_steps, save_json, slug
+
 RAW_FILE = "raw_recording.json"
 SKILLS_DIR = "skills"
-DOUBLE_CLICK_SECONDS = 0.6
 
 NAME_SCHEMA = {
     "type": "object",
@@ -40,16 +41,6 @@ def load_raw():
         return None
 
 
-def clean_label(name):
-    """Remove changing suffixes such as ' - 1 running window pinned'."""
-    return re.sub(r"\s*-\s*\d+\s+running\s+windows?.*$", "", name or "").strip()
-
-
-def slug(text):
-    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")[:40]
-
-
-# ---------------------------------------------------------------------------
 def choose_apps(events):
     """Let the user keep only the app(s) that belong to the task."""
     counts = Counter(e.get("app", "unknown") for e in events)
@@ -61,116 +52,37 @@ def choose_apps(events):
         raw = input("Keep which? Type numbers like 2,3 - or just press Enter to keep all: ").strip()
         if not raw:
             return events
-        keep = set()
-        valid = True
-        for part in raw.split(","):
-            try:
-                n = int(part.strip())
-            except ValueError:
-                valid = False
-                break
-            if not 1 <= n <= len(apps):
-                valid = False
-                break
-            keep.add(apps[n - 1])
-        if not valid:
+        try:
+            picked = parse_steps(raw)
+        except ValueError as exc:
+            print(f"  {exc}")
+            continue
+        if not picked or not all(1 <= n <= len(apps) for n in picked):
             print("  Please type numbers from the list above, like 2,3.")
             continue
+        keep = {apps[n - 1] for n in picked}
         return [e for e in events if e.get("app", "unknown") in keep]
 
 
 def build_steps(events):
-    steps = []
-    last_click_t = 0.0
-    for e in events:
-        action = e["action"]
-
-        if action == "click":
-            t = e["target"]
-            if not t.get("name", "").strip() and not t.get("automation_id", "").strip():
-                continue  # unnamed element: cannot be found again reliably
-            key = (t["name"], t["control_type"], t["automation_id"], e["app"])
-            prev = steps[-1] if steps else None
-            if (
-                prev
-                and prev.get("_key") == key
-                and e["button"] == "left"
-                and e["t"] - last_click_t <= DOUBLE_CLICK_SECONDS
-            ):
-                prev["action"] = "double_click_element"
-                last_click_t = e["t"]
-                continue
-            step_action = {
-                "left": "click_element",
-                "right": "right_click_element",
-                "middle": "middle_click_element",
-            }.get(e["button"], "click_element")
-            steps.append(
-                {
-                    "action": step_action,
-                    "target": {
-                        "name": clean_label(t["name"]),
-                        "control_type": t["control_type"],
-                        "automation_id": t["automation_id"],
-                        "class_name": t.get("class_name", ""),
-                    },
-                    "app": e["app"],
-                    "window_class": e.get("window_class", ""),
-                    "fallback_rel_pos": t.get("rel_pos"),
-                    "_key": key,
-                }
-            )
-            last_click_t = e["t"]
-
-        elif action == "type_text":
-            if e.get("sensitive"):
-                steps.append({"action": "enter_password", "source": "user_input"})
-            else:
-                steps.append({"action": "type_text", "text": e["text"]})
-
-        elif action == "press_key":
-            steps.append({"action": "press_key", "key": e["key"]})
-
+    steps = learner.build_steps(events)
     for s in steps:
-        s.pop("_key", None)
-    return collapse_repeats(steps)
-
-
-def collapse_repeats(steps):
-    """Merge consecutive identical key presses into one step with a repeat count."""
-    out = []
-    for s in steps:
-        if (
-            out
-            and s["action"] == "press_key"
-            and out[-1]["action"] == "press_key"
-            and out[-1]["key"] == s["key"]
-        ):
-            out[-1]["repeat"] = out[-1].get("repeat", 1) + 1
-        else:
-            out.append(s)
-    return out
+        s.pop("parameterizable", None)   # only meaningful for /learn profiles
+    return steps
 
 
 def remove_steps(steps):
     """Let the user delete steps that were not part of the task."""
-    raw = input("\nRemove any steps? Type numbers like 5-8,12 - or just press Enter to keep all: ").strip()
-    if not raw:
-        return steps
-    drop = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
+    while True:
+        raw = input("\nRemove any steps? Type numbers like 5-8,12 - or just press Enter to keep all: ").strip()
+        if not raw:
+            return steps
         try:
-            if "-" in part:
-                a, b = part.split("-", 1)
-                drop.update(range(int(a), int(b) + 1))
-            else:
-                drop.add(int(part))
-        except ValueError:
-            print(f"  Ignored '{part}'.")
-    return [s for i, s in enumerate(steps, 1) if i not in drop]
+            drop = parse_steps(raw)
+        except ValueError as exc:
+            print(f"  {exc}")
+            continue
+        return [s for i, s in enumerate(steps, 1) if i not in drop]
 
 
 def ask_parameters(steps):
@@ -200,21 +112,8 @@ def ask_parameters(steps):
 
 
 # ---------------------------------------------------------------------------
-def summarize_step(s):
-    a = s["action"]
-    if a.endswith("click_element"):
-        t = s["target"]
-        return f"{a} '{t['name']}' ({t['control_type']}) in {s['app']}"
-    if a == "type_text":
-        return f"type text {s['text']!r}"
-    if a == "press_key":
-        times = f" x{s['repeat']}" if s.get("repeat") else ""
-        return f"press key {s['key']}{times}"
-    return a
-
-
 def suggest_name(intent, steps):
-    summary = "\n".join(f"- {summarize_step(s)}" for s in steps)
+    summary = "\n".join(f"- {describe_step(s, detailed=True)}" for s in steps)
     prompt = (
         "Give this recorded automation a short snake_case name (2 to 4 words) "
         "and a one-sentence description.\n"
@@ -239,9 +138,10 @@ def suggest_name(intent, steps):
 
 # ---------------------------------------------------------------------------
 def main(intent=None):
-    print("=== Skill Builder v2 ===")
+    print("=== Skill Builder v3 ===")
     raw = load_raw()
     if not raw:
+        print("Nothing usable in the recording.")
         return
 
     events = choose_apps(raw)
@@ -252,7 +152,7 @@ def main(intent=None):
 
     print(f"\nBuilt {len(steps)} steps:")
     for i, s in enumerate(steps, 1):
-        print(f"  {i}. {summarize_step(s)}")
+        print(f"  {i}. {describe_step(s, detailed=True)}")
 
     trimmed = remove_steps(steps)
     if len(trimmed) != len(steps):
@@ -262,7 +162,7 @@ def main(intent=None):
             return
         print(f"\nNow {len(steps)} steps:")
         for i, s in enumerate(steps, 1):
-            print(f"  {i}. {summarize_step(s)}")
+            print(f"  {i}. {describe_step(s, detailed=True)}")
 
     intent = (intent or input("\nWhat is the goal of this demonstration? ")).strip()
     params = ask_parameters(steps)
@@ -281,7 +181,6 @@ def main(intent=None):
         "created": datetime.now().isoformat(timespec="seconds"),
     }
 
-    os.makedirs(SKILLS_DIR, exist_ok=True)
     path = os.path.join(SKILLS_DIR, f"{name}.json")
     if os.path.exists(path):
         if input(f"'{path}' exists. Overwrite? [y/N]: ").strip().lower() != "y":
@@ -291,13 +190,15 @@ def main(intent=None):
                 return
             skill["name"] = new_name
             path = os.path.join(SKILLS_DIR, f"{new_name}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(skill, f, indent=2, ensure_ascii=False)
+    save_json(path, skill)
     print(f"\nSaved skill to {path}")
 
     if input("Delete the raw recording now? [Y/n]: ").strip().lower() != "n":
-        os.remove(RAW_FILE)
-        print("Raw recording deleted.")
+        try:
+            os.remove(RAW_FILE)
+            print("Raw recording deleted.")
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

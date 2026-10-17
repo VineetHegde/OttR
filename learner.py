@@ -22,6 +22,8 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 
+from common import clean_label, mermaid_label, norm, save_json, slug, write_flowchart_html
+
 RAW_FILE = "raw_recording.json"
 PROFILES_DIR = os.path.join("skills", "apps")
 CROP_DIR = os.path.join("skills", "crops")
@@ -44,17 +46,6 @@ DOUBLE_CLICK_SECONDS = 0.6
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
-def clean_label(name):
-    """Strip changing suffixes such as ' - 2 running windows'."""
-    name = re.sub(r"\s*-\s*\d+\s+running\s+windows?.*$", "", name or "")
-    name = re.sub(r"\s*-\s*Memory usage\s*-\s*[\d.,]+\s*[KMGT]?B.*$", "", name, flags=re.I)
-    return name.strip()
-
-
-def slug(text, limit=40):
-    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")[:limit]
-
-
 NOISE_NAMES = {"non client input sink window"}
 
 
@@ -77,10 +68,6 @@ def app_of(e):
 
 def is_shell(e):
     return app_of(e).lower() in SHELL_APPS
-
-
-def norm(text):
-    return "".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
 
 
 def trigger_label(e):
@@ -219,7 +206,8 @@ def describe_steps(steps):
 
 def postcondition_of(steps):
     for s in reversed(steps):
-        if s.get("state_after") and s["action"].endswith("_element"):
+        st = s.get("state_after") or {}
+        if ("selected" in st or "toggle" in st) and s["action"].endswith("_element"):
             t = s["target"]
             return {"target": {k: t.get(k, "") for k in ("name", "control_type", "automation_id")},
                     "app": s.get("app", ""), "window_class": s.get("window_class", ""),
@@ -332,7 +320,7 @@ def segment(events):
     launch_triggers = defaultdict(list)
     candidates = [e for e in events if e["action"] not in LIFECYCLE and is_trigger(e)]
     labeled = [e for e in candidates if trigger_label(e)]
-    unlabeled = [e for e in candidates if not trigger_label(e)]
+    plain_keys = [e for e in candidates if not trigger_label(e)]
     for e in labeled:
         for i, L in enumerate(launches):
             if (L["t"] >= e["t"] - 0.2 and L["t"] - e["t"] <= TRIGGER_WINDOW
@@ -343,7 +331,7 @@ def segment(events):
     for i in list(launch_triggers):  # plain keys (Win, Enter) around a matching click / typed text
         evs = launch_triggers[i]
         lo, hi = min(x["t"] for x in evs) - 2.5, max(x["t"] for x in evs) + 2.5
-        for e in unlabeled:
+        for e in plain_keys:
             if id(e) not in used and lo <= e["t"] <= min(hi, launches[i]["t"] + 0.2):
                 evs.append(e)
                 used.add(id(e))
@@ -352,7 +340,7 @@ def segment(events):
     # events inside apps
     content = defaultdict(list)
     ignored = Counter()
-    unlabeled = 0
+    skipped_clicks = 0
     for e in events:
         a = e["action"]
         if a not in ("click", "type_text", "press_key"):
@@ -372,7 +360,7 @@ def segment(events):
         if a == "press_key" and e.get("key") in SYSTEM_KEYS:
             continue
         if a == "click" and click_step(e) is None:
-            unlabeled += 1
+            skipped_clicks += 1
             continue
         display.setdefault(k, app)
         content[k].append(e)
@@ -457,7 +445,7 @@ def segment(events):
         })
 
     return {"profiles": profiles, "ignored": dict(ignored), "dropped": dropped,
-            "unlabeled_clicks": unlabeled, "event_count": len(events)}
+            "unlabeled_clicks": skipped_clicks, "event_count": len(events)}
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +488,7 @@ def merge_and_save(profile):
         old["sessions"] = old.get("sessions", 1) + 1
         old["updated"] = profile["updated"]
         profile, new_actions = old, len(added)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(profile, f, indent=2, ensure_ascii=False)
+    save_json(path, profile)
     return path, new_actions
 
 
@@ -570,6 +557,25 @@ def print_report(result, saved):
         print(f"{result['unlabeled_clicks']} click(s) had no name and no usable position, so they were skipped.")
 
 
+def generate_learn_flowchart(result):
+    lines = ["graph TD", "    Start((Session Start))"]
+    n, prev = 0, "Start"
+    for p in result.get("profiles", []):
+        n += 1
+        node = f"App_{n}"
+        lines.append(f'    {prev} -->|Opens| {node}["{mermaid_label(p.get("app", "Unknown App"))}"]')
+        prev = node
+        for action in p.get("actions", []):
+            n += 1
+            node = f"Act_{n}"
+            lines.append(f'    {prev} --> {node}["{mermaid_label(action.get("name", "Unknown Action"))}"]')
+            prev = node
+    lines.append(f"    {prev} --> End((Session End))")
+    path = write_flowchart_html("learn_Output", "learn", "Learned Session Flowchart", lines)
+    if path:
+        print(f"\n[+] Visual flowchart saved to: {path}")
+
+
 def learn_from_recording(path=RAW_FILE, delete_raw=True):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -577,12 +583,24 @@ def learn_from_recording(path=RAW_FILE, delete_raw=True):
     except FileNotFoundError:
         print(f"'{path}' not found. Run the recorder first.")
         return None
-    result = segment(events)
-    saved = {}
-    for p in result["profiles"]:
-        saved[p["app"]] = merge_and_save(p)
-    clean_unused_crops()
-    print_report(result, saved)
+    except json.JSONDecodeError as exc:
+        print(f"'{path}' is not valid JSON ({exc}). Record again.")
+        return None
+
+    try:
+        result = segment(events)
+        saved = {}
+        for p in result["profiles"]:
+            saved[p["app"]] = merge_and_save(p)
+        clean_unused_crops()
+        print_report(result, saved)
+        generate_learn_flowchart(result)
+    except Exception:
+        # Do NOT delete the recording: it is the only copy of the demonstration.
+        # It contains everything typed (except password fields), so delete it yourself once you are done.
+        print(f"\nLearning failed. '{path}' was kept so you can retry after a fix; it contains the text you typed.")
+        raise
+
     if delete_raw:
         try:
             os.remove(path)

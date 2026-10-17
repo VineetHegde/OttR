@@ -12,40 +12,17 @@ edit_skill.py - tidy a saved skill without editing JSON by hand.
 import argparse
 import json
 import os
-import re
+
+from common import describe_step, parse_steps, save_json, slug
 
 SKILLS_DIR = "skills"
 
 
-def summarize(s):
-    a = s["action"]
-    if a.endswith("click_element"):
-        t = s["target"]
-        return f"{a} '{t.get('name') or t.get('automation_id')}' in {s.get('app')}"
-    if a == "type_text":
-        return f"type {s['text']!r}"
-    if a == "press_key":
-        times = f" x{s['repeat']}" if s.get("repeat") else ""
-        return f"press {s['key']}{times}"
-    return a
-
-
-def parse_steps(text):
-    chosen = set()
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            chosen.update(range(int(a), int(b) + 1))
-        else:
-            chosen.add(int(part))
-    return chosen
-
-
-def slug(text):
-    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:40]
+def show(skill):
+    print(f"Name: {skill.get('name')}")
+    print(f"Description: {skill.get('description')}")
+    for i, s in enumerate(skill.get("steps", []), 1):
+        print(f"  {i}. {describe_step(s)}")
 
 
 def main():
@@ -58,6 +35,9 @@ def main():
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
+    if os.path.basename(args.skill) != args.skill:
+        print("Give the skill name only (no folders).")
+        return
     old_path = os.path.join(SKILLS_DIR, f"{args.skill}.json")
     if not os.path.exists(old_path):
         print(f"Not found: {old_path}")
@@ -66,18 +46,20 @@ def main():
         skill = json.load(f)
 
     if args.show or not (args.keep or args.name or args.description):
-        print(f"Name: {skill.get('name')}")
-        print(f"Description: {skill.get('description')}")
-        for i, s in enumerate(skill.get("steps", []), 1):
-            print(f"  {i}. {summarize(s)}")
+        show(skill)
         return
 
     if args.keep:
-        keep = parse_steps(args.keep)
-        skill["steps"] = [s for i, s in enumerate(skill["steps"], 1) if i in keep]
-        if not skill["steps"]:
+        try:
+            keep = parse_steps(args.keep)
+        except ValueError as exc:
+            print(f"--keep: {exc}. Nothing changed.")
+            return
+        steps = [s for i, s in enumerate(skill.get("steps", []), 1) if i in keep]
+        if not steps:
             print("No steps would be left. Nothing changed.")
             return
+        skill["steps"] = steps
     if args.description:
         skill["description"] = args.description.strip()
     if args.name:
@@ -88,13 +70,12 @@ def main():
         print(f"'{new_path}' already exists. Delete it first or add --force.")
         return
 
-    with open(new_path, "w", encoding="utf-8") as f:
-        json.dump(skill, f, indent=2, ensure_ascii=False)
+    save_json(new_path, skill)
     if new_path != old_path:
         os.remove(old_path)
     print(f"Saved {new_path} with {len(skill['steps'])} steps:")
     for i, s in enumerate(skill["steps"], 1):
-        print(f"  {i}. {summarize(s)}")
+        print(f"  {i}. {describe_step(s)}")
 
 
 if __name__ == "__main__":

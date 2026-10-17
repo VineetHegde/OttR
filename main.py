@@ -1,5 +1,5 @@
 import difflib
-import glob
+import inspect
 import json
 import os
 import re
@@ -13,11 +13,13 @@ import psutil
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
+from common import MODEL, stem
+
 # Saved-skill execution lives in executor.py
 from executor import list_skills, load_skill
 from executor import run_skill as execute_skill
 
-MODEL = "llama3.2:1b"  # change here if you switch models
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================
 # 1. REAL WINDOWS TOOLS
@@ -26,7 +28,10 @@ MODEL = "llama3.2:1b"  # change here if you switch models
 def set_volume(level: int) -> str:
     """Sets master Windows system volume to a percentage (0-100)."""
     try:
-        level = max(0, min(100, int(level)))
+        m = re.search(r"\d+(?:\.\d+)?", str(level))   # the model may say "15%" or "15"
+        if not m:
+            return f"Failed to set volume: '{level}' is not a number."
+        level = max(0, min(100, int(float(m.group()))))
         devices = AudioUtilities.GetSpeakers()
         if hasattr(devices, "EndpointVolume"):      # newer pycaw
             volume = devices.EndpointVolume
@@ -39,27 +44,67 @@ def set_volume(level: int) -> str:
         return f"Failed to set volume: {str(e)}"
 
 
+SEARCH_DEPTH = 4                                   # folders below Desktop/Documents/Downloads to look in
+SKIP_DIRS = {".git", "node_modules", "__pycache__", "appdata", ".venv", "venv"}
+BAD_NAME_CHARS = set('<>:"/\\|?*')
+RESERVED_NAMES = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+
+
+def bad_filename_reason(name):
+    """Why `name` cannot be a plain file name (no folders, no Windows-illegal characters), or None."""
+    if not name or not name.strip():
+        return "it is empty"
+    if any(c in BAD_NAME_CHARS or ord(c) < 32 for c in name):
+        return "it contains a folder separator or another character Windows does not allow in file names"
+    if name in {".", ".."} or name != name.rstrip(" ."):
+        return "it ends with a space or a dot"
+    if os.path.splitext(name)[0].lower() in RESERVED_NAMES:
+        return "it is a reserved Windows device name"
+    return None
+
+
+def find_files(filename):
+    """Case-insensitive search for an exact file name under Desktop, Documents and Downloads."""
+    user_profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    wanted = filename.lower()
+    hits = {}
+    for sub in ("Desktop", "Documents", "Downloads"):
+        root = os.path.join(user_profile, sub)
+        if not os.path.isdir(root):
+            continue
+        base_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath.count(os.sep) - base_depth >= SEARCH_DEPTH:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+            for fn in filenames:
+                if fn.lower() == wanted:
+                    full = os.path.join(dirpath, fn)
+                    hits.setdefault(os.path.normcase(os.path.realpath(full)), full)   # OneDrive can overlap folders
+    return sorted(hits.values())
+
+
 def find_and_rename_file(filename: str, new_name: str) -> str:
     """Searches Desktop, Documents, Downloads and renames the file (then verifies)."""
-    user_profile = os.environ.get("USERPROFILE", "C:\\Users\\Default")
-    search_dirs = [
-        os.path.join(user_profile, "Desktop"),
-        os.path.join(user_profile, "Documents"),
-        os.path.join(user_profile, "Downloads"),
-    ]
+    for label, value in (("filename", filename), ("new name", new_name)):
+        reason = bad_filename_reason(str(value or ""))
+        if reason:
+            return f"Error: the {label} '{value}' is not allowed: {reason}."
 
-    target_path = None
-    for folder in search_dirs:
-        matches = glob.glob(os.path.join(folder, "**", filename), recursive=True)
-        if matches:
-            target_path = matches[0]
-            break
-
-    if not target_path:
+    matches = find_files(filename)
+    if not matches:
         return f"Error: File '{filename}' not found in Desktop, Documents, or Downloads."
+    if len(matches) > 1:
+        listing = "; ".join(matches[:5])
+        return (f"Error: Found {len(matches)} files named '{filename}' ({listing}). "
+                "I need an exact match to avoid renaming the wrong one.")
 
-    new_path = os.path.join(os.path.dirname(target_path), new_name)
-    if os.path.exists(new_path):
+    target_path = matches[0]
+    folder = os.path.dirname(target_path)
+    new_path = os.path.join(folder, new_name)
+    case_only = os.path.normcase(new_path) == os.path.normcase(target_path)
+    if os.path.exists(new_path) and not case_only:
         return f"Error: '{new_path}' already exists. Nothing was renamed."
 
     try:
@@ -67,8 +112,7 @@ def find_and_rename_file(filename: str, new_name: str) -> str:
     except Exception as e:
         return f"Failed to rename file: {str(e)}"
 
-    # Verification: did it really happen?
-    if os.path.exists(new_path) and not os.path.exists(target_path):
+    if new_name in os.listdir(folder) and (case_only or not os.path.exists(target_path)):
         return f"Success (verified): Renamed '{target_path}' -> '{new_path}'"
     return "Rename was attempted but could not be verified."
 
@@ -84,11 +128,12 @@ def get_battery() -> str:
 
 def get_running_processes(search_name: str = "") -> str:
     """Lists running background processes, optionally filtered by name."""
+    needle = (search_name or "").lower()
     matching = []
     for proc in psutil.process_iter(["pid", "name"]):
         try:
-            name = proc.info["name"]
-            if search_name.lower() in name.lower():
+            name = proc.info.get("name") or ""
+            if needle in name.lower():
                 matching.append(f"{name} (PID: {proc.info['pid']})")
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -98,7 +143,6 @@ def get_running_processes(search_name: str = "") -> str:
     return f"Found {len(matching)} processes: " + ", ".join(matching[:5])
 
 
-# Only these apps can be launched by the AI (no free-form commands, no shell)
 APP_ALLOWLIST = {
     "notepad": "notepad.exe",
     "calculator": "calc.exe",
@@ -119,7 +163,7 @@ def open_app(app_name: str) -> str:
             "You can teach me this task with:  /teach <what the task is>"
         )
     try:
-        os.startfile(exe)  # no shell command line is built, so nothing can be injected
+        os.startfile(exe)
         return f"Application '{app_name}' launched."
     except Exception as e:
         return f"Failed to launch '{app_name}': {str(e)}"
@@ -157,8 +201,42 @@ TOOL_REGISTRY = {
     "run_skill": run_skill,
 }
 
+# Tools that change something the user cannot easily undo: ask before running.
+CONFIRM_TOOLS = {
+    "find_and_rename_file": lambda a: f"Rename '{a.get('filename')}' to '{a.get('new_name')}'?",
+}
+
+# The router's answer is forced into this shape (the tool name can only be one of ours), so the
+# "model answered with prose / markdown / a made-up tool" failures cannot happen.
+ROUTER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool": {"type": "string", "enum": list(TOOL_REGISTRY)},
+        "args": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "number"},
+                "filename": {"type": "string"},
+                "new_name": {"type": "string"},
+                "search_name": {"type": "string"},
+                "app_name": {"type": "string"},
+                "skill_name": {"type": "string"},
+                "parameters": {"type": "object"},
+            },
+        },
+    },
+    "required": ["tool", "args"],
+}
+
+
+def clean_args(fn, args):
+    """Keep only the arguments the tool really takes (the model may add extra ones)."""
+    allowed = inspect.signature(fn).parameters
+    return {k: v for k, v in args.items() if k in allowed}
+
+
 # ==========================================
-# 2. SKILL SHORTLIST (keeps the 1B model's job small)
+# 2. SKILL SHORTLIST (keeps the small model's job small)
 # ==========================================
 
 STOPWORDS = {"the", "a", "an", "to", "in", "on", "of", "for", "my", "me", "please", "and", "is", "it"}
@@ -171,15 +249,6 @@ def words(text):
             continue
         out.add(stem(w))
     return out
-
-
-def stem(w):
-    """Very small plural-stripper: searches->search, files->file, tutorials->tutorial."""
-    if len(w) > 4 and w.endswith(("ches", "shes", "sses", "xes", "zes")):
-        return w[:-2]
-    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
-        return w[:-1]
-    return w
 
 
 def shortlist_skills(user_input, limit=3):
@@ -195,14 +264,12 @@ def shortlist_skills(user_input, limit=3):
     return sorted(skills, key=score, reverse=True)[:limit]
 
 
-MATCH_MIN_WORDS = 2        # at least this many shared words
-MATCH_MIN_COVERAGE = 0.6   # and this share of the request's OR the skill's words
+MATCH_MIN_WORDS = 2
+MATCH_MIN_COVERAGE = 0.6
 
 
 def match_skill(user_input):
-    """Return the saved skill that clearly matches the request, or None.
-    Plain word matching: the 1B model is unreliable at choosing between a
-    generic tool and a saved skill, so code decides when the match is clear."""
+    """Return the saved skill that clearly matches the request, or None."""
     req = words(user_input)
     if not req:
         return None
@@ -221,7 +288,7 @@ def match_skill(user_input):
     if overlap < MATCH_MIN_WORDS or coverage < MATCH_MIN_COVERAGE:
         return None
     if len(scored) > 1 and scored[1][0] == overlap:
-        return None  # ambiguous: let the LLM choose from the shortlist
+        return None
     return best
 
 
@@ -322,8 +389,6 @@ def build_system_prompt(user_input):
     )
 
 
-# A tool may only run if the request actually mentions what it does. This stops the small
-# model from sending e.g. "open photos" to the file-rename tool or "change wallpaper" to volume.
 TOOL_KEYWORDS = {
     "find_and_rename_file": {"rename", "name", "call"},
     "set_volume": {"volume", "sound", "audio", "louder", "quieter", "mute", "unmute"},
@@ -345,7 +410,7 @@ def tool_fits_request(tool, user_input):
 # ==========================================
 
 def extract_text_value(clause, example):
-    """Ask the model ONLY for the text to type in a learned action (e.g. what to calculate or search)."""
+    """Ask the model ONLY for the text to type in a learned action."""
     schema = {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]}
     prompt = (
         f"In an earlier demonstration the user typed: {example!r}.\n"
@@ -362,10 +427,16 @@ def extract_text_value(clause, example):
         return None
 
 
+def parse_router_output(raw_content):
+    """Model text -> dict, tolerating a markdown fence in case the server ignored `format`."""
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_content.strip(), flags=re.S).strip()
+    return json.loads(text)
+
+
 def process_user_request(user_input: str):
     print(f'\nUser Input: "{user_input}"')
 
-    # Step 1: does the request clearly match a saved skill? (decided by code, not the model)
+    # Step 1: does the request clearly match a saved skill?
     skill = match_skill(user_input)
     if skill:
         print(f"Matched saved skill '{skill['name']}'")
@@ -375,7 +446,7 @@ def process_user_request(user_input: str):
         print(f"Result: {run_skill(skill['name'], params)}")
         return
 
-    # Step 1b: requests about apps learned with /learn (open/close/minimize them, run learned actions)
+    # Step 1b: requests about apps learned with /learn
     try:
         import planner
         handled = planner.handle_request(user_input, extract_value=extract_text_value,
@@ -394,7 +465,7 @@ def process_user_request(user_input: str):
                 {"role": "system", "content": build_system_prompt(user_input)},
                 {"role": "user", "content": user_input},
             ],
-            format="json",
+            format=ROUTER_SCHEMA,
             options={"temperature": 0.0},
         )
     except Exception as e:
@@ -402,9 +473,8 @@ def process_user_request(user_input: str):
         return
 
     raw_content = response["message"]["content"]
-
     try:
-        data = json.loads(raw_content)
+        data = parse_router_output(raw_content)
     except json.JSONDecodeError:
         print(f"Error: Invalid JSON returned from LLM:\n{raw_content}")
         return
@@ -426,8 +496,16 @@ def process_user_request(user_input: str):
         print(f"Result: {unknown()}")
         return
 
+    fn = TOOL_REGISTRY[tool_name]
+    args = clean_args(fn, args)
+
+    if tool_name in CONFIRM_TOOLS:
+        if input(f"{CONFIRM_TOOLS[tool_name](args)} [y/N]: ").strip().lower() != "y":
+            print("Result: Cancelled.")
+            return
+
     try:
-        result = TOOL_REGISTRY[tool_name](**args)
+        result = fn(**args)
     except TypeError as e:
         print(f"Error: the model gave wrong arguments for '{tool_name}': {e}")
         return
@@ -449,16 +527,21 @@ def self_test():
     process_user_request("Is chrome running right now?")
 
 
+def _run_recorder():
+    recorder = os.path.join(HERE, "recorder.py")
+    subprocess.run([sys.executable, recorder])
+
+
 def teach_single_task(goal=""):
     """Teach ONE task (old flow): record once, then build a single replayable skill."""
-    if not os.path.exists("recorder.py"):
+    if not os.path.exists(os.path.join(HERE, "recorder.py")):
         print("Error: recorder.py must be in the same folder as main.py.")
         return
     print("\n=== Learning mode ===")
     print("1. Switch to your app and do the task ONCE, exactly as you normally would.")
     print("2. Press F8 when you are done. (F7 pauses recording, e.g. for a password.)")
     input("Press Enter here to start recording... ")
-    subprocess.run([sys.executable, "recorder.py"])
+    _run_recorder()
     if not os.path.exists("raw_recording.json"):
         print("No recording was saved. Nothing learned.")
         return
@@ -469,7 +552,7 @@ def teach_single_task(goal=""):
 
 def learn_from_session():
     """Free-form learning: record everything you do; the assistant separates it by app on its own."""
-    if not os.path.exists("recorder.py") or not os.path.exists("learner.py"):
+    if not all(os.path.exists(os.path.join(HERE, f)) for f in ("recorder.py", "learner.py")):
         print("Error: recorder.py and learner.py must be in the same folder as main.py.")
         return
     print("\n=== Learning mode ===")
@@ -477,7 +560,7 @@ def learn_from_session():
     print("You do not need to name anything. Press F8 when you are done.")
     print("(F7 pauses recording, e.g. while typing a password.)")
     input("Press Enter here to start recording... ")
-    subprocess.run([sys.executable, "recorder.py"])
+    _run_recorder()
     if not os.path.exists("raw_recording.json"):
         print("No recording was saved. Nothing learned.")
         return

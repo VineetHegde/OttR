@@ -1,4 +1,5 @@
-@"
+
+@'
 .venv/
 __pycache__/
 *.py[cod]
@@ -7,4 +8,15 @@ __pycache__/
 !.env.example
 .vscode/
 .idea/
-"@ | Out-File -FilePath .gitignore -Encoding utf8
+
+# Local archives and generated output
+Old/
+execute_Output/
+learn_Output/
+
+# Keep these folders empty in Git
+skills/apps/**
+!skills/apps/.gitkeep
+skills/crops/**
+!skills/crops/.gitkeep
+'@ | Set-Content -Path .gitignore -Encoding utf8
